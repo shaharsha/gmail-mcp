@@ -36,6 +36,10 @@ type NewMessage = {
   bcc?: string[] | undefined
   subject?: string | undefined
   body?: string | undefined
+  htmlBody?: string | undefined
+  replyToMessageId?: string | undefined
+  inReplyTo?: string | undefined
+  references?: string | undefined
   includeBodyHtml?: boolean
   attachments?: Attachment[]
   skipQuotedContent?: boolean
@@ -171,34 +175,20 @@ const getQuotedContent = (thread: Thread) => {
   return quotedContent.join('\n')
 }
 
-const getThreadHeaders = (thread: Thread) => {
-  let headers: string[] = []
-
-  if (!thread.messages?.length) return headers
-
-  const lastMessage = thread.messages[thread.messages.length - 1]
-  const references: string[] = []
-
-  let subjectHeader = findHeader(lastMessage.payload?.headers || [], 'subject')
-  if (subjectHeader) {
-    if (!subjectHeader.toLowerCase().startsWith('re:')) {
-      subjectHeader = `Re: ${subjectHeader}`
-    }
-    headers.push(`Subject: ${subjectHeader}`)
+// Derive reply headers (Re: subject, In-Reply-To, References) from a message's headers.
+const deriveReply = (msgHeaders: MessagePartHeader[]) => {
+  let subject = findHeader(msgHeaders, 'subject') || ''
+  if (subject && !subject.toLowerCase().startsWith('re:')) subject = `Re: ${subject}`
+  const messageId = findHeader(msgHeaders, 'message-id')
+  const refsHeader = findHeader(msgHeaders, 'references')
+  const references = messageId
+    ? [refsHeader, messageId].filter(Boolean).join(' ')
+    : (refsHeader || undefined)
+  return {
+    subject: subject || undefined,
+    inReplyTo: messageId || undefined,
+    references: references || undefined
   }
-
-  const messageIdHeader = findHeader(lastMessage.payload?.headers || [], 'message-id')
-  if (messageIdHeader) {
-    headers.push(`In-Reply-To: ${messageIdHeader}`)
-    references.push(messageIdHeader)
-  }
-
-  const referencesHeader = findHeader(lastMessage.payload?.headers || [], 'references')
-  if (referencesHeader) references.unshift(...referencesHeader.split(' '))
-
-  if (references.length > 0) headers.push(`References: ${references.join(' ')}`)
-
-  return headers
 }
 
 const wrapTextBody = (text: string): string => text.split('\n').map(line => {
@@ -266,32 +256,71 @@ const buildAttachmentPart = (attachment: Attachment, boundary: string): string =
   ].join('\r\n')
 }
 
+const wrapBase64 = (base64: string) => (base64.replace(/\s+/g, '').match(/.{1,76}/g) || []).join('\r\n')
+
+const buildTextPart = (text: string) => [
+  'Content-Type: text/plain; charset="UTF-8"',
+  'Content-Transfer-Encoding: quoted-printable',
+  '',
+  text
+]
+
+const buildHtmlPart = (html: string) => [
+  'Content-Type: text/html; charset="UTF-8"',
+  'Content-Transfer-Encoding: base64',
+  '',
+  wrapBase64(Buffer.from(html, 'utf-8').toString('base64'))
+]
+
+// Minimal HTML -> plain-text fallback for the text/plain alternative when only htmlBody is given.
+const htmlToPlainText = (html: string) => html
+  .replace(/<(script|style)[^>]*>[\s\S]*?<\/\1>/gi, '')
+  .replace(/<br\s*\/?>/gi, '\n')
+  .replace(/<\/(p|div|h[1-6]|li|tr)>/gi, '\n')
+  .replace(/<[^>]+>/g, '')
+  .replace(/&nbsp;/gi, ' ').replace(/&amp;/gi, '&').replace(/&lt;/gi, '<').replace(/&gt;/gi, '>').replace(/&quot;/gi, '"').replace(/&#39;/gi, "'")
+  .replace(/\n{3,}/g, '\n\n')
+  .trim()
+
 const constructRawMessage = async (gmail: gmail_v1.Gmail, params: NewMessage) => {
-  let thread: Thread | null = null
-  if (params.threadId) {
-    const threadParams = { userId: 'me', id: params.threadId, format: 'full' }
-    const { data } = await gmail.users.threads.get(threadParams)
-    thread = data
+  // Resolve reply context from an explicit message id (most precise) or the thread's last message.
+  let reply: { subject?: string; inReplyTo?: string; references?: string } = {}
+  if (params.replyToMessageId) {
+    const { data: original } = await gmail.users.messages.get({
+      userId: 'me', id: params.replyToMessageId, format: 'metadata', metadataHeaders: ['Subject', 'Message-ID', 'References']
+    })
+    reply = deriveReply(original.payload?.headers || [])
+    if (!params.threadId && original.threadId) params.threadId = original.threadId
   }
 
+  let thread: Thread | null = null
+  if (params.threadId) {
+    const { data } = await gmail.users.threads.get({ userId: 'me', id: params.threadId, format: 'full' })
+    thread = data
+    if (!params.replyToMessageId && thread.messages?.length) {
+      reply = deriveReply(thread.messages[thread.messages.length - 1].payload?.headers || [])
+    }
+  }
+
+  // Headers — explicit params always override reply-derived values.
   const headers: string[] = []
   if (params.to?.length) headers.push(`To: ${wrapTextBody(params.to.map(sanitizeHeaderValue).join(', '))}`)
   if (params.cc?.length) headers.push(`Cc: ${wrapTextBody(params.cc.map(sanitizeHeaderValue).join(', '))}`)
   if (params.bcc?.length) headers.push(`Bcc: ${wrapTextBody(params.bcc.map(sanitizeHeaderValue).join(', '))}`)
-  if (thread) {
-    const threadHeaders = params.subject !== undefined
-      ? [`Subject: ${sanitizeHeaderValue(params.subject)}`, ...getThreadHeaders(thread).filter(header => !/^subject:/i.test(header))]
-      : getThreadHeaders(thread)
-    headers.push(...threadHeaders.map(header => wrapTextBody(header)))
-  } else if (params.subject !== undefined) {
-    headers.push(`Subject: ${wrapTextBody(sanitizeHeaderValue(params.subject))}`)
-  } else {
-    headers.push('Subject: (No Subject)')
-  }
+
+  const subject = params.subject !== undefined ? params.subject : (reply.subject ?? '(No Subject)')
+  headers.push(`Subject: ${wrapTextBody(sanitizeHeaderValue(subject))}`)
+
+  const inReplyTo = params.inReplyTo ?? reply.inReplyTo
+  const references = params.references ?? reply.references
+  if (inReplyTo) headers.push(`In-Reply-To: ${sanitizeHeaderValue(inReplyTo)}`)
+  if (references) headers.push(`References: ${sanitizeHeaderValue(references)}`)
   headers.push('MIME-Version: 1.0')
 
+  // Plain-text body (+ quoted reply history for threads).
   const bodyParts: string[] = []
   if (params.body) bodyParts.push(wrapTextBody(params.body))
+  else if (params.htmlBody !== undefined) bodyParts.push(wrapTextBody(htmlToPlainText(params.htmlBody)))
   if (thread && !params.skipQuotedContent) {
     const quotedContent = getQuotedContent(thread)
     if (quotedContent) {
@@ -301,26 +330,32 @@ const constructRawMessage = async (gmail: gmail_v1.Gmail, params: NewMessage) =>
   }
   const textBody = bodyParts.join('\r\n')
 
-  const message: string[] = [...headers]
+  const rand = () => `${Date.now()}_${Math.floor(Math.random() * 1e9)}`
 
-  if (params.attachments?.length) {
-    const boundary = `----=_Part_${Date.now()}_${Math.floor(Math.random() * 1e9)}`
-    message.push(`Content-Type: multipart/mixed; boundary="${boundary}"`)
-    message.push('')
-    message.push(`--${boundary}`)
-    message.push('Content-Type: text/plain; charset="UTF-8"')
-    message.push('Content-Transfer-Encoding: quoted-printable')
-    message.push('')
-    message.push(textBody)
-    for (const attachment of params.attachments) {
-      message.push(buildAttachmentPart(attachment, boundary))
-    }
-    message.push(`--${boundary}--`)
+  // Inner content: a single text/plain part, or multipart/alternative (text + html) when htmlBody is given.
+  let inner: string[]
+  if (params.htmlBody !== undefined) {
+    const altBoundary = `----=_Alt_${rand()}`
+    inner = [
+      `Content-Type: multipart/alternative; boundary="${altBoundary}"`, '',
+      `--${altBoundary}`, ...buildTextPart(textBody),
+      `--${altBoundary}`, ...buildHtmlPart(params.htmlBody),
+      `--${altBoundary}--`
+    ]
   } else {
-    message.push('Content-Type: text/plain; charset="UTF-8"')
-    message.push('Content-Transfer-Encoding: quoted-printable')
-    message.push('')
-    message.push(textBody)
+    inner = buildTextPart(textBody)
+  }
+
+  // Wrap in multipart/mixed when there are attachments.
+  const message: string[] = [...headers]
+  if (params.attachments?.length) {
+    const mixedBoundary = `----=_Mixed_${rand()}`
+    message.push(`Content-Type: multipart/mixed; boundary="${mixedBoundary}"`, '')
+    message.push(`--${mixedBoundary}`, ...inner)
+    for (const attachment of params.attachments) message.push(buildAttachmentPart(attachment, mixedBoundary))
+    message.push(`--${mixedBoundary}--`)
+  } else {
+    message.push(...inner)
   }
 
   return Buffer.from(message.join('\r\n')).toString('base64url').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
@@ -368,7 +403,11 @@ function createServer({ config }: { config?: Record<string, any> }) {
         content: z.string().optional().describe("Base64-encoded file content. Provide either content or path; prefer path for large files to keep requests small."),
         path: z.string().optional().describe("Local filesystem path for the server to read and attach. Provide either path or content."),
         inline: z.boolean().optional().describe("Attach inline (e.g. an image referenced from HTML) rather than as a downloadable file. Defaults to false.")
-      })).optional().describe("Files to attach to the message")
+      })).optional().describe("Files to attach to the message"),
+      htmlBody: z.string().optional().describe("HTML body. When set, the message is sent as multipart/alternative; the plain-text part comes from body, or is auto-generated from the HTML when body is omitted."),
+      replyToMessageId: z.string().optional().describe("Message ID being replied to. Auto-populates In-Reply-To/References, the thread association, and a Re: subject (each overridable by the matching explicit param)."),
+      inReplyTo: z.string().optional().describe("Manual In-Reply-To header (the Message-ID being replied to). Normally set automatically via replyToMessageId."),
+      references: z.string().optional().describe("Manual References header (space-separated Message-IDs). Normally set automatically via replyToMessageId.")
     },
     async (params) => {
       return handleTool(config, async (gmail: gmail_v1.Gmail) => {
@@ -507,7 +546,11 @@ function createServer({ config }: { config?: Record<string, any> }) {
         content: z.string().optional().describe("Base64-encoded file content. Provide either content or path; prefer path for large files to keep requests small."),
         path: z.string().optional().describe("Local filesystem path for the server to read and attach. Provide either path or content."),
         inline: z.boolean().optional().describe("Attach inline (e.g. an image referenced from HTML) rather than as a downloadable file. Defaults to false.")
-      })).optional().describe("Files to attach to the message")
+      })).optional().describe("Files to attach to the message"),
+      htmlBody: z.string().optional().describe("HTML body. When set, the message is sent as multipart/alternative; the plain-text part comes from body, or is auto-generated from the HTML when body is omitted."),
+      replyToMessageId: z.string().optional().describe("Message ID being replied to. Auto-populates In-Reply-To/References, the thread association, and a Re: subject (each overridable by the matching explicit param)."),
+      inReplyTo: z.string().optional().describe("Manual In-Reply-To header (the Message-ID being replied to). Normally set automatically via replyToMessageId."),
+      references: z.string().optional().describe("Manual References header (space-separated Message-IDs). Normally set automatically via replyToMessageId.")
     },
     async (params) => {
       return handleTool(config, async (gmail: gmail_v1.Gmail) => {
@@ -520,6 +563,8 @@ function createServer({ config }: { config?: Record<string, any> }) {
         if (!params.cc) params.cc = formatEmailList(findHeader(payload?.headers || [], 'cc'))
         if (!params.bcc) params.bcc = formatEmailList(findHeader(payload?.headers || [], 'bcc'))
         if (params.subject === undefined) params.subject = findHeader(payload?.headers || [], 'subject') ?? undefined
+        if (params.inReplyTo === undefined) params.inReplyTo = findHeader(payload?.headers || [], 'in-reply-to') ?? undefined
+        if (params.references === undefined) params.references = findHeader(payload?.headers || [], 'references') ?? undefined
         if (params.body === undefined) {
           const bodyData = findPartByMime(payload, 'text/plain')?.body?.data ?? payload?.body?.data
           if (bodyData) params.body = Buffer.from(bodyData, 'base64url').toString('utf-8')
@@ -709,13 +754,16 @@ function createServer({ config }: { config?: Record<string, any> }) {
     "Get a specific message by ID with format options",
     {
       id: z.string().describe("The ID of the message to retrieve"),
+      format: z.enum(['full', 'metadata', 'minimal']).optional().describe("Gmail fetch format. 'full' (default) returns the parsed body; 'metadata' returns headers only (pair with metadataHeaders) and is far smaller; 'minimal' returns only ids/labels."),
+      metadataHeaders: z.array(z.string()).optional().describe("When format is 'metadata', restrict the returned headers to these names, e.g. ['Subject','Message-ID','From']."),
       includeBodyHtml: z.boolean().optional().describe("Whether to include the parsed HTML in the return for each body, excluded by default because they can be excessively large")
     },
     async (params) => {
       return handleTool(config, async (gmail: gmail_v1.Gmail) => {
-        const { data } = await gmail.users.messages.get({ userId: 'me', id: params.id, format: 'full' })
+        const format = params.format ?? 'full'
+        const { data } = await gmail.users.messages.get({ userId: 'me', id: params.id, format, metadataHeaders: params.metadataHeaders })
 
-        if (data.payload) {
+        if (format === 'full' && data.payload) {
           data.payload = processMessagePart(data.payload, params.includeBodyHtml)
         }
 
@@ -787,7 +835,11 @@ function createServer({ config }: { config?: Record<string, any> }) {
         content: z.string().optional().describe("Base64-encoded file content. Provide either content or path; prefer path for large files to keep requests small."),
         path: z.string().optional().describe("Local filesystem path for the server to read and attach. Provide either path or content."),
         inline: z.boolean().optional().describe("Attach inline (e.g. an image referenced from HTML) rather than as a downloadable file. Defaults to false.")
-      })).optional().describe("Files to attach to the message")
+      })).optional().describe("Files to attach to the message"),
+      htmlBody: z.string().optional().describe("HTML body. When set, the message is sent as multipart/alternative; the plain-text part comes from body, or is auto-generated from the HTML when body is omitted."),
+      replyToMessageId: z.string().optional().describe("Message ID being replied to. Auto-populates In-Reply-To/References, the thread association, and a Re: subject (each overridable by the matching explicit param)."),
+      inReplyTo: z.string().optional().describe("Manual In-Reply-To header (the Message-ID being replied to). Normally set automatically via replyToMessageId."),
+      references: z.string().optional().describe("Manual References header (space-separated Message-IDs). Normally set automatically via replyToMessageId.")
     },
     async (params) => {
       return handleTool(config, async (gmail: gmail_v1.Gmail) => {
@@ -870,13 +922,16 @@ function createServer({ config }: { config?: Record<string, any> }) {
     "Get a specific thread by ID",
     {
       id: z.string().describe("The ID of the thread to retrieve"),
+      format: z.enum(['full', 'metadata', 'minimal']).optional().describe("Gmail fetch format. 'full' (default) returns parsed bodies; 'metadata' returns headers only (pair with metadataHeaders) and is far smaller; 'minimal' returns only ids/labels."),
+      metadataHeaders: z.array(z.string()).optional().describe("When format is 'metadata', restrict the returned headers to these names, e.g. ['Subject','Message-ID','From']."),
       includeBodyHtml: z.boolean().optional().describe("Whether to include the parsed HTML in the return for each body, excluded by default because they can be excessively large")
     },
     async (params) => {
       return handleTool(config, async (gmail: gmail_v1.Gmail) => {
-        const { data } = await gmail.users.threads.get({ userId: 'me', id: params.id, format: 'full' })
+        const format = params.format ?? 'full'
+        const { data } = await gmail.users.threads.get({ userId: 'me', id: params.id, format, metadataHeaders: params.metadataHeaders })
 
-        if (data.messages) {
+        if (format === 'full' && data.messages) {
           data.messages = data.messages.map(message => {
             if (message.payload) {
               message.payload = processMessagePart(message.payload, params.includeBodyHtml)
