@@ -346,10 +346,14 @@ function createServer({ config }: { config?: Record<string, any> }) {
 
         drafts.push(...data.drafts || [])
 
-        while (data.nextPageToken) {
+        while (data.nextPageToken && (params.maxResults === undefined || drafts.length < params.maxResults)) {
           const { data: nextData } = await gmail.users.drafts.list({ userId: 'me', ...params, pageToken: data.nextPageToken })
           drafts.push(...nextData.drafts || [])
           data = nextData
+        }
+
+        if (params.maxResults !== undefined) {
+          drafts = drafts.slice(0, params.maxResults)
         }
 
         if (drafts) {
