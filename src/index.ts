@@ -20,6 +20,14 @@ type MessagePartHeader = gmail_v1.Schema$MessagePartHeader
 type MessageSendParams = gmail_v1.Params$Resource$Users$Messages$Send
 type Thread = gmail_v1.Schema$Thread
 
+type Attachment = {
+  filename?: string
+  mimeType?: string
+  content?: string
+  path?: string
+  inline?: boolean
+}
+
 type NewMessage = {
   threadId?: string
   raw?: string
@@ -29,6 +37,8 @@ type NewMessage = {
   subject?: string | undefined
   body?: string | undefined
   includeBodyHtml?: boolean
+  attachments?: Attachment[]
+  skipQuotedContent?: boolean
 }
 
 const RESPONSE_HEADERS_LIST = [
@@ -197,6 +207,65 @@ const wrapTextBody = (text: string): string => text.split('\n').map(line => {
   return chunks.join('=\n')
 }).join('\n')
 
+// Strip CR/LF from header values to prevent RFC822 header injection via user-controlled fields.
+const sanitizeHeaderValue = (value: string) => value.replace(/[\r\n]+/g, ' ').trim()
+
+// Depth-first search for the first part of a given MIME type that carries inline body data.
+const findPartByMime = (part: MessagePart | undefined, mimeType: string): MessagePart | undefined => {
+  if (!part) return undefined
+  if (part.mimeType === mimeType && part.body?.data) return part
+  for (const sub of part.parts || []) {
+    const found = findPartByMime(sub, mimeType)
+    if (found) return found
+  }
+  return undefined
+}
+
+const MIME_TYPES: Record<string, string> = {
+  pdf: 'application/pdf', txt: 'text/plain', csv: 'text/csv', json: 'application/json',
+  html: 'text/html', htm: 'text/html', xml: 'application/xml', zip: 'application/zip',
+  png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif',
+  webp: 'image/webp', svg: 'image/svg+xml', ico: 'image/x-icon',
+  doc: 'application/msword',
+  docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  xls: 'application/vnd.ms-excel',
+  xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  ppt: 'application/vnd.ms-powerpoint',
+  pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  mp3: 'audio/mpeg', mp4: 'video/mp4', mov: 'video/quicktime'
+}
+
+const guessMimeType = (filename: string) => {
+  const ext = filename.includes('.') ? filename.split('.').pop()!.toLowerCase() : ''
+  return MIME_TYPES[ext] || 'application/octet-stream'
+}
+
+// Plain quoted form for ASCII filenames; RFC 2231 extended form for non-ASCII.
+const encodeHeaderFilename = (key: string, filename: string) =>
+  /^[\x20-\x7E]*$/.test(filename)
+    ? `${key}="${filename.replace(/"/g, '')}"`
+    : `${key}*=UTF-8''${encodeURIComponent(filename)}`
+
+const buildAttachmentPart = (attachment: Attachment, boundary: string): string => {
+  const filename = attachment.filename || (attachment.path ? attachment.path.split('/').pop()! : 'attachment')
+  const mimeType = attachment.mimeType || guessMimeType(filename)
+  let base64 = attachment.content ?? (attachment.path ? fs.readFileSync(attachment.path).toString('base64') : '')
+  if (!base64) throw new Error(`Attachment "${filename}" has neither content nor a readable path`)
+  // Accept standard or url-safe base64 input; normalize and pad, then wrap at 76 chars (RFC 2045).
+  base64 = base64.replace(/-/g, '+').replace(/_/g, '/').replace(/\s+/g, '').replace(/=+$/, '')
+  while (base64.length % 4) base64 += '='
+  const wrapped = (base64.match(/.{1,76}/g) || []).join('\r\n')
+  const disposition = attachment.inline ? 'inline' : 'attachment'
+  return [
+    `--${boundary}`,
+    `Content-Type: ${mimeType}; ${encodeHeaderFilename('name', filename)}`,
+    'Content-Transfer-Encoding: base64',
+    `Content-Disposition: ${disposition}; ${encodeHeaderFilename('filename', filename)}`,
+    '',
+    wrapped
+  ].join('\r\n')
+}
+
 const constructRawMessage = async (gmail: gmail_v1.Gmail, params: NewMessage) => {
   let thread: Thread | null = null
   if (params.threadId) {
@@ -205,33 +274,53 @@ const constructRawMessage = async (gmail: gmail_v1.Gmail, params: NewMessage) =>
     thread = data
   }
 
-  const message = []
-  if (params.to?.length) message.push(`To: ${wrapTextBody(params.to.join(', '))}`)
-  if (params.cc?.length) message.push(`Cc: ${wrapTextBody(params.cc.join(', '))}`)
-  if (params.bcc?.length) message.push(`Bcc: ${wrapTextBody(params.bcc.join(', '))}`)
+  const headers: string[] = []
+  if (params.to?.length) headers.push(`To: ${wrapTextBody(params.to.map(sanitizeHeaderValue).join(', '))}`)
+  if (params.cc?.length) headers.push(`Cc: ${wrapTextBody(params.cc.map(sanitizeHeaderValue).join(', '))}`)
+  if (params.bcc?.length) headers.push(`Bcc: ${wrapTextBody(params.bcc.map(sanitizeHeaderValue).join(', '))}`)
   if (thread) {
-    const threadHeaders = params.subject
-      ? [`Subject: ${params.subject}`, ...getThreadHeaders(thread).filter(header => !/^subject:/i.test(header))]
+    const threadHeaders = params.subject !== undefined
+      ? [`Subject: ${sanitizeHeaderValue(params.subject)}`, ...getThreadHeaders(thread).filter(header => !/^subject:/i.test(header))]
       : getThreadHeaders(thread)
-    message.push(...threadHeaders.map(header => wrapTextBody(header)))
-  } else if (params.subject) {
-    message.push(`Subject: ${wrapTextBody(params.subject)}`)
+    headers.push(...threadHeaders.map(header => wrapTextBody(header)))
+  } else if (params.subject !== undefined) {
+    headers.push(`Subject: ${wrapTextBody(sanitizeHeaderValue(params.subject))}`)
   } else {
-    message.push('Subject: (No Subject)')
+    headers.push('Subject: (No Subject)')
   }
-  message.push('Content-Type: text/plain; charset="UTF-8"')
-  message.push('Content-Transfer-Encoding: quoted-printable')
-  message.push('MIME-Version: 1.0')
-  message.push('')
+  headers.push('MIME-Version: 1.0')
 
-  if (params.body) message.push(wrapTextBody(params.body))
-
-  if (thread) {
+  const bodyParts: string[] = []
+  if (params.body) bodyParts.push(wrapTextBody(params.body))
+  if (thread && !params.skipQuotedContent) {
     const quotedContent = getQuotedContent(thread)
     if (quotedContent) {
-      message.push('')
-      message.push(wrapTextBody(quotedContent))
+      bodyParts.push('')
+      bodyParts.push(wrapTextBody(quotedContent))
     }
+  }
+  const textBody = bodyParts.join('\r\n')
+
+  const message: string[] = [...headers]
+
+  if (params.attachments?.length) {
+    const boundary = `----=_Part_${Date.now()}_${Math.floor(Math.random() * 1e9)}`
+    message.push(`Content-Type: multipart/mixed; boundary="${boundary}"`)
+    message.push('')
+    message.push(`--${boundary}`)
+    message.push('Content-Type: text/plain; charset="UTF-8"')
+    message.push('Content-Transfer-Encoding: quoted-printable')
+    message.push('')
+    message.push(textBody)
+    for (const attachment of params.attachments) {
+      message.push(buildAttachmentPart(attachment, boundary))
+    }
+    message.push(`--${boundary}--`)
+  } else {
+    message.push('Content-Type: text/plain; charset="UTF-8"')
+    message.push('Content-Transfer-Encoding: quoted-printable')
+    message.push('')
+    message.push(textBody)
   }
 
   return Buffer.from(message.join('\r\n')).toString('base64url').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
@@ -272,7 +361,14 @@ function createServer({ config }: { config?: Record<string, any> }) {
       bcc: z.array(z.string()).optional().describe("List of BCC recipient email addresses"),
       subject: z.string().optional().describe("The subject of the email"),
       body: z.string().optional().describe("The body of the email"),
-      includeBodyHtml: z.boolean().optional().describe("Whether to include the parsed HTML in the return for each body, excluded by default because they can be excessively large")
+      includeBodyHtml: z.boolean().optional().describe("Whether to include the parsed HTML in the return for each body, excluded by default because they can be excessively large"),
+      attachments: z.array(z.object({
+        filename: z.string().optional().describe("Attachment filename, e.g. report.pdf. Inferred from the path if omitted."),
+        mimeType: z.string().optional().describe("MIME type, e.g. application/pdf. Inferred from the filename extension if omitted."),
+        content: z.string().optional().describe("Base64-encoded file content. Provide either content or path; prefer path for large files to keep requests small."),
+        path: z.string().optional().describe("Local filesystem path for the server to read and attach. Provide either path or content."),
+        inline: z.boolean().optional().describe("Attach inline (e.g. an image referenced from HTML) rather than as a downloadable file. Defaults to false.")
+      })).optional().describe("Files to attach to the message")
     },
     async (params) => {
       return handleTool(config, async (gmail: gmail_v1.Gmail) => {
@@ -404,7 +500,14 @@ function createServer({ config }: { config?: Record<string, any> }) {
       bcc: z.array(z.string()).optional().describe("List of BCC recipient email addresses, will be copied from the current draft if not provided"),
       subject: z.string().optional().describe("The subject of the email, will be copied from the current draft if not provided"),
       body: z.string().optional().describe("The body of the email, will be copied from the current draft if not provided"),
-      includeBodyHtml: z.boolean().optional().describe("Whether to include the parsed HTML in the return for each body, excluded by default because they can be excessively large")
+      includeBodyHtml: z.boolean().optional().describe("Whether to include the parsed HTML in the return for each body, excluded by default because they can be excessively large"),
+      attachments: z.array(z.object({
+        filename: z.string().optional().describe("Attachment filename, e.g. report.pdf. Inferred from the path if omitted."),
+        mimeType: z.string().optional().describe("MIME type, e.g. application/pdf. Inferred from the filename extension if omitted."),
+        content: z.string().optional().describe("Base64-encoded file content. Provide either content or path; prefer path for large files to keep requests small."),
+        path: z.string().optional().describe("Local filesystem path for the server to read and attach. Provide either path or content."),
+        inline: z.boolean().optional().describe("Attach inline (e.g. an image referenced from HTML) rather than as a downloadable file. Defaults to false.")
+      })).optional().describe("Files to attach to the message")
     },
     async (params) => {
       return handleTool(config, async (gmail: gmail_v1.Gmail) => {
@@ -416,10 +519,30 @@ function createServer({ config }: { config?: Record<string, any> }) {
         if (!params.to) params.to = formatEmailList(findHeader(payload?.headers || [], 'to'))
         if (!params.cc) params.cc = formatEmailList(findHeader(payload?.headers || [], 'cc'))
         if (!params.bcc) params.bcc = formatEmailList(findHeader(payload?.headers || [], 'bcc'))
-        if (!params.subject) params.subject = findHeader(payload?.headers || [], 'subject') ?? undefined
-        if (!params.body) {
-          const bodyData = payload?.parts?.find(part => part.mimeType === 'text/plain')?.body?.data ?? payload?.body?.data
+        if (params.subject === undefined) params.subject = findHeader(payload?.headers || [], 'subject') ?? undefined
+        if (params.body === undefined) {
+          const bodyData = findPartByMime(payload, 'text/plain')?.body?.data ?? payload?.body?.data
           if (bodyData) params.body = Buffer.from(bodyData, 'base64url').toString('utf-8')
+          // The preserved body already contains any quoted reply history; don't let constructRawMessage re-append it.
+          params.skipQuotedContent = true
+        }
+        if (!params.attachments) {
+          const existing: { filename: string; mimeType?: string; attachmentId: string }[] = []
+          const collectAttachments = (part?: MessagePart) => {
+            if (!part) return
+            const attachmentId = part.body?.attachmentId
+            if (part.filename && attachmentId) existing.push({ filename: part.filename, mimeType: part.mimeType ?? undefined, attachmentId })
+            part.parts?.forEach(collectAttachments)
+          }
+          collectAttachments(payload)
+          const messageId = currentDraft.data.message?.id
+          if (existing.length && messageId) {
+            params.attachments = []
+            for (const att of existing) {
+              const { data: attData } = await gmail.users.messages.attachments.get({ userId: 'me', messageId, id: att.attachmentId })
+              if (attData.data) params.attachments.push({ filename: att.filename, mimeType: att.mimeType, content: attData.data })
+            }
+          }
         }
 
         if (!raw) raw = await constructRawMessage(gmail, params)
@@ -657,7 +780,14 @@ function createServer({ config }: { config?: Record<string, any> }) {
       bcc: z.array(z.string()).optional().describe("List of BCC recipient email addresses"),
       subject: z.string().optional().describe("The subject of the email"),
       body: z.string().optional().describe("The body of the email"),
-      includeBodyHtml: z.boolean().optional().describe("Whether to include the parsed HTML in the return for each body, excluded by default because they can be excessively large")
+      includeBodyHtml: z.boolean().optional().describe("Whether to include the parsed HTML in the return for each body, excluded by default because they can be excessively large"),
+      attachments: z.array(z.object({
+        filename: z.string().optional().describe("Attachment filename, e.g. report.pdf. Inferred from the path if omitted."),
+        mimeType: z.string().optional().describe("MIME type, e.g. application/pdf. Inferred from the filename extension if omitted."),
+        content: z.string().optional().describe("Base64-encoded file content. Provide either content or path; prefer path for large files to keep requests small."),
+        path: z.string().optional().describe("Local filesystem path for the server to read and attach. Provide either path or content."),
+        inline: z.boolean().optional().describe("Attach inline (e.g. an image referenced from HTML) rather than as a downloadable file. Defaults to false.")
+      })).optional().describe("Files to attach to the message")
     },
     async (params) => {
       return handleTool(config, async (gmail: gmail_v1.Gmail) => {
