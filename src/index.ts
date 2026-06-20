@@ -342,13 +342,14 @@ function createServer({ config }: { config?: Record<string, any> }) {
       return handleTool(config, async (gmail: gmail_v1.Gmail) => {
         let drafts: Draft[] = []
 
-        const { data } = await gmail.users.drafts.list({ userId: 'me', ...params })
+        let { data } = await gmail.users.drafts.list({ userId: 'me', ...params })
 
         drafts.push(...data.drafts || [])
 
         while (data.nextPageToken) {
           const { data: nextData } = await gmail.users.drafts.list({ userId: 'me', ...params, pageToken: data.nextPageToken })
           drafts.push(...nextData.drafts || [])
+          data = nextData
         }
 
         if (drafts) {
