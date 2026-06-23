@@ -223,6 +223,32 @@ const foldHeader = (name: string, value: string): string => {
   return lines.join('\r\n')
 }
 
+// RFC 2047 encoded-word for non-ASCII header text. ASCII passes through untouched.
+const isAscii = (s: string) => /^[\x00-\x7F]*$/.test(s)
+
+const encodeWord = (text: string): string => {
+  const bytes = Buffer.from(text, 'utf-8')
+  const maxBytes = 36 // 36B -> base64 48ch -> word 60ch, safely under the RFC 2047 75ch encoded-word limit
+  const words: string[] = []
+  for (let i = 0; i < bytes.length;) {
+    let end = Math.min(i + maxBytes, bytes.length)
+    while (end < bytes.length && (bytes[end] & 0xc0) === 0x80) end-- // don't split a UTF-8 sequence
+    words.push(`=?UTF-8?B?${bytes.subarray(i, end).toString('base64')}?=`)
+    i = end
+  }
+  return words.join('\r\n ') // fold between encoded-words with CRLF + space
+}
+
+// Encode only a display name (never the addr-spec) for non-ASCII addresses.
+const encodeAddress = (addr: string): string => {
+  const value = sanitizeHeaderValue(addr)
+  const match = value.match(/^(.*?)\s*<([^>]+)>$/)
+  if (!match) return value // bare addr-spec, e.g. a@b.com
+  const name = match[1].replace(/^"(.*)"$/, '$1')
+  if (!name) return `<${match[2]}>`
+  return `${isAscii(name) ? `"${name.replace(/"/g, '')}"` : encodeWord(name)} <${match[2]}>`
+}
+
 // Depth-first search for the first part of a given MIME type that carries inline body data.
 const findPartByMime = (part: MessagePart | undefined, mimeType: string): MessagePart | undefined => {
   if (!part) return undefined
@@ -327,12 +353,13 @@ const constructRawMessage = async (gmail: gmail_v1.Gmail, params: NewMessage) =>
 
   // Headers — explicit params always override reply-derived values.
   const headers: string[] = []
-  if (params.to?.length) headers.push(foldHeader('To', params.to.map(sanitizeHeaderValue).join(', ')))
-  if (params.cc?.length) headers.push(foldHeader('Cc', params.cc.map(sanitizeHeaderValue).join(', ')))
-  if (params.bcc?.length) headers.push(foldHeader('Bcc', params.bcc.map(sanitizeHeaderValue).join(', ')))
+  if (params.to?.length) headers.push(foldHeader('To', params.to.map(encodeAddress).join(', ')))
+  if (params.cc?.length) headers.push(foldHeader('Cc', params.cc.map(encodeAddress).join(', ')))
+  if (params.bcc?.length) headers.push(foldHeader('Bcc', params.bcc.map(encodeAddress).join(', ')))
 
   const subject = params.subject !== undefined ? params.subject : (reply.subject ?? '(No Subject)')
-  headers.push(foldHeader('Subject', sanitizeHeaderValue(subject)))
+  const cleanSubject = sanitizeHeaderValue(subject)
+  headers.push(isAscii(cleanSubject) ? foldHeader('Subject', cleanSubject) : `Subject: ${encodeWord(cleanSubject)}`)
 
   const inReplyTo = params.inReplyTo ?? reply.inReplyTo
   const references = params.references ?? reply.references
