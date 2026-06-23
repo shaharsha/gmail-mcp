@@ -200,6 +200,27 @@ const wrapTextBody = (text: string): string => text.split('\n').map(line => {
 // Strip CR/LF from header values to prevent RFC822 header injection via user-controlled fields.
 const sanitizeHeaderValue = (value: string) => value.replace(/[\r\n]+/g, ' ').trim()
 
+// RFC 5322 header folding: wrap long headers onto continuation lines (CRLF + space),
+// breaking after commas (address lists). Never emits quoted-printable "=\n" (which is invalid in headers).
+const foldHeader = (name: string, value: string): string => {
+  if (`${name}: ${value}`.length <= 78) return `${name}: ${value}`
+  const segments = value.split(', ')
+  const lines: string[] = []
+  let line = `${name}:`
+  segments.forEach((seg, i) => {
+    const token = i < segments.length - 1 ? `${seg},` : seg
+    const candidate = `${line} ${token}`
+    if (candidate.length > 78 && line !== `${name}:`) {
+      lines.push(line)
+      line = ` ${token}`
+    } else {
+      line = candidate
+    }
+  })
+  lines.push(line)
+  return lines.join('\r\n')
+}
+
 // Depth-first search for the first part of a given MIME type that carries inline body data.
 const findPartByMime = (part: MessagePart | undefined, mimeType: string): MessagePart | undefined => {
   if (!part) return undefined
@@ -304,12 +325,12 @@ const constructRawMessage = async (gmail: gmail_v1.Gmail, params: NewMessage) =>
 
   // Headers — explicit params always override reply-derived values.
   const headers: string[] = []
-  if (params.to?.length) headers.push(`To: ${wrapTextBody(params.to.map(sanitizeHeaderValue).join(', '))}`)
-  if (params.cc?.length) headers.push(`Cc: ${wrapTextBody(params.cc.map(sanitizeHeaderValue).join(', '))}`)
-  if (params.bcc?.length) headers.push(`Bcc: ${wrapTextBody(params.bcc.map(sanitizeHeaderValue).join(', '))}`)
+  if (params.to?.length) headers.push(foldHeader('To', params.to.map(sanitizeHeaderValue).join(', ')))
+  if (params.cc?.length) headers.push(foldHeader('Cc', params.cc.map(sanitizeHeaderValue).join(', ')))
+  if (params.bcc?.length) headers.push(foldHeader('Bcc', params.bcc.map(sanitizeHeaderValue).join(', ')))
 
   const subject = params.subject !== undefined ? params.subject : (reply.subject ?? '(No Subject)')
-  headers.push(`Subject: ${wrapTextBody(sanitizeHeaderValue(subject))}`)
+  headers.push(foldHeader('Subject', sanitizeHeaderValue(subject)))
 
   const inReplyTo = params.inReplyTo ?? reply.inReplyTo
   const references = params.references ?? reply.references
