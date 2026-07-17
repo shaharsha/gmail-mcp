@@ -437,15 +437,15 @@ function createServer({ config }: { config?: Record<string, any> }) {
   }
 
   server.tool("create_draft",
-    "Create a draft email in Gmail. Note the mechanics of the raw parameter.",
+    "Create a draft email in Gmail. Prefer the structured params: to/cc/subject plus htmlBody (HTML/RTL) or body (plain text); use raw only for a pre-built MIME message.",
     {
-      raw: z.string().optional().describe("The entire email message in base64url encoded RFC 2822 format, ignores params.to, cc, bcc, subject, body, includeBodyHtml if provided"),
+      raw: z.string().optional().describe("ADVANCED / last resort: prefer to, cc, subject, body, and htmlBody instead. A pre-built entire email in base64url-encoded RFC 2822 format; when provided it overrides to, cc, bcc, subject, body, htmlBody, and includeBodyHtml. Do NOT hand-build this: it bypasses the server's RTL/HTML and header handling and bloats the conversation transcript with a large opaque blob."),
       threadId: z.string().optional().describe("The thread ID to associate this draft with"),
       to: z.array(z.string()).optional().describe("List of recipient email addresses"),
       cc: z.array(z.string()).optional().describe("List of CC recipient email addresses"),
       bcc: z.array(z.string()).optional().describe("List of BCC recipient email addresses"),
       subject: z.string().optional().describe("The subject of the email"),
-      body: z.string().optional().describe("The body of the email"),
+      body: z.string().optional().describe("PLAIN-TEXT body only. Do NOT put HTML here; tags will render literally as text. For HTML or right-to-left text (Hebrew/Arabic) use htmlBody instead."),
       includeBodyHtml: z.boolean().optional().describe("Whether to include the parsed HTML in the return for each body, excluded by default because they can be excessively large"),
       attachments: z.array(z.object({
         filename: z.string().optional().describe("Attachment filename, e.g. report.pdf. Inferred from the path if omitted."),
@@ -454,7 +454,7 @@ function createServer({ config }: { config?: Record<string, any> }) {
         path: z.string().optional().describe("Local filesystem path for the server to read and attach. Provide either path or content."),
         inline: z.boolean().optional().describe("Attach inline (e.g. an image referenced from HTML) rather than as a downloadable file. Defaults to false.")
       })).optional().describe("Files to attach to the message"),
-      htmlBody: z.string().optional().describe("HTML body. When set, the message is sent as multipart/alternative; the plain-text part comes from body, or is auto-generated from the HTML when body is omitted."),
+      htmlBody: z.string().optional().describe("HTML body. When set, the message is sent as multipart/alternative; the plain-text part comes from body, or is auto-generated from the HTML when body is omitted. For right-to-left languages (Hebrew/Arabic) wrap the content in <div dir=\"rtl\" style=\"text-align:right\">...</div> so it renders right-aligned."),
       replyToMessageId: z.string().optional().describe("Message ID being replied to. Auto-populates In-Reply-To/References, the thread association, and a Re: subject (each overridable by the matching explicit param)."),
       inReplyTo: z.string().optional().describe("Manual In-Reply-To header (the Message-ID being replied to). Normally set automatically via replyToMessageId."),
       references: z.string().optional().describe("Manual References header (space-separated Message-IDs). Normally set automatically via replyToMessageId.")
@@ -579,16 +579,16 @@ function createServer({ config }: { config?: Record<string, any> }) {
   )
 
   server.tool("update_draft",
-    "Replace a draft's content. Note the mechanics of the threadId and raw parameters.",
+    "Replace a draft's content. Prefer the structured params: to/cc/subject plus htmlBody (HTML/RTL) or body (plain text); use raw only for a pre-built MIME message. threadId is copied from the current draft if omitted.",
     {
       id: z.string().describe("The ID of the draft to update"),
       threadId: z.string().optional().describe("The thread ID to associate this draft with, will be copied from the current draft if not provided"),
-      raw: z.string().optional().describe("The entire email message in base64url encoded RFC 2822 format, ignores params.to, cc, bcc, subject, body, includeBodyHtml if provided"),
+      raw: z.string().optional().describe("ADVANCED / last resort: prefer to, cc, subject, body, and htmlBody instead. A pre-built entire email in base64url-encoded RFC 2822 format; when provided it overrides to, cc, bcc, subject, body, htmlBody, and includeBodyHtml. Do NOT hand-build this: it bypasses the server's RTL/HTML and header handling and bloats the conversation transcript with a large opaque blob."),
       to: z.array(z.string()).optional().describe("List of recipient email addresses, will be copied from the current draft if not provided"),
       cc: z.array(z.string()).optional().describe("List of CC recipient email addresses, will be copied from the current draft if not provided"),
       bcc: z.array(z.string()).optional().describe("List of BCC recipient email addresses, will be copied from the current draft if not provided"),
       subject: z.string().optional().describe("The subject of the email, will be copied from the current draft if not provided"),
-      body: z.string().optional().describe("The body of the email, will be copied from the current draft if not provided"),
+      body: z.string().optional().describe("PLAIN-TEXT body only (copied from the current draft if not provided). Do NOT put HTML here; tags will render literally. For HTML or right-to-left text (Hebrew/Arabic) use htmlBody instead."),
       includeBodyHtml: z.boolean().optional().describe("Whether to include the parsed HTML in the return for each body, excluded by default because they can be excessively large"),
       attachments: z.array(z.object({
         filename: z.string().optional().describe("Attachment filename, e.g. report.pdf. Inferred from the path if omitted."),
@@ -597,7 +597,7 @@ function createServer({ config }: { config?: Record<string, any> }) {
         path: z.string().optional().describe("Local filesystem path for the server to read and attach. Provide either path or content."),
         inline: z.boolean().optional().describe("Attach inline (e.g. an image referenced from HTML) rather than as a downloadable file. Defaults to false.")
       })).optional().describe("Files to attach to the message"),
-      htmlBody: z.string().optional().describe("HTML body. When set, the message is sent as multipart/alternative; the plain-text part comes from body, or is auto-generated from the HTML when body is omitted."),
+      htmlBody: z.string().optional().describe("HTML body. When set, the message is sent as multipart/alternative; the plain-text part comes from body, or is auto-generated from the HTML when body is omitted. For right-to-left languages (Hebrew/Arabic) wrap the content in <div dir=\"rtl\" style=\"text-align:right\">...</div> so it renders right-aligned."),
       replyToMessageId: z.string().optional().describe("Message ID being replied to. Auto-populates In-Reply-To/References, the thread association, and a Re: subject (each overridable by the matching explicit param)."),
       inReplyTo: z.string().optional().describe("Manual In-Reply-To header (the Message-ID being replied to). Normally set automatically via replyToMessageId."),
       references: z.string().optional().describe("Manual References header (space-separated Message-IDs). Normally set automatically via replyToMessageId.")
@@ -869,15 +869,15 @@ function createServer({ config }: { config?: Record<string, any> }) {
   )
 
   server.tool("send_message",
-    "Send an email message to specified recipients. Note the mechanics of the raw parameter.",
+    "Send an email message to specified recipients. Prefer the structured params: to/cc/subject plus htmlBody (HTML/RTL) or body (plain text); use raw only for a pre-built MIME message.",
     {
-      raw: z.string().optional().describe("The entire email message in base64url encoded RFC 2822 format, ignores params.to, cc, bcc, subject, body, includeBodyHtml if provided"),
+      raw: z.string().optional().describe("ADVANCED / last resort: prefer to, cc, subject, body, and htmlBody instead. A pre-built entire email in base64url-encoded RFC 2822 format; when provided it overrides to, cc, bcc, subject, body, htmlBody, and includeBodyHtml. Do NOT hand-build this: it bypasses the server's RTL/HTML and header handling and bloats the conversation transcript with a large opaque blob."),
       threadId: z.string().optional().describe("The thread ID to associate this message with"),
       to: z.array(z.string()).optional().describe("List of recipient email addresses"),
       cc: z.array(z.string()).optional().describe("List of CC recipient email addresses"),
       bcc: z.array(z.string()).optional().describe("List of BCC recipient email addresses"),
       subject: z.string().optional().describe("The subject of the email"),
-      body: z.string().optional().describe("The body of the email"),
+      body: z.string().optional().describe("PLAIN-TEXT body only. Do NOT put HTML here; tags will render literally as text. For HTML or right-to-left text (Hebrew/Arabic) use htmlBody instead."),
       includeBodyHtml: z.boolean().optional().describe("Whether to include the parsed HTML in the return for each body, excluded by default because they can be excessively large"),
       attachments: z.array(z.object({
         filename: z.string().optional().describe("Attachment filename, e.g. report.pdf. Inferred from the path if omitted."),
@@ -886,7 +886,7 @@ function createServer({ config }: { config?: Record<string, any> }) {
         path: z.string().optional().describe("Local filesystem path for the server to read and attach. Provide either path or content."),
         inline: z.boolean().optional().describe("Attach inline (e.g. an image referenced from HTML) rather than as a downloadable file. Defaults to false.")
       })).optional().describe("Files to attach to the message"),
-      htmlBody: z.string().optional().describe("HTML body. When set, the message is sent as multipart/alternative; the plain-text part comes from body, or is auto-generated from the HTML when body is omitted."),
+      htmlBody: z.string().optional().describe("HTML body. When set, the message is sent as multipart/alternative; the plain-text part comes from body, or is auto-generated from the HTML when body is omitted. For right-to-left languages (Hebrew/Arabic) wrap the content in <div dir=\"rtl\" style=\"text-align:right\">...</div> so it renders right-aligned."),
       replyToMessageId: z.string().optional().describe("Message ID being replied to. Auto-populates In-Reply-To/References, the thread association, and a Re: subject (each overridable by the matching explicit param)."),
       inReplyTo: z.string().optional().describe("Manual In-Reply-To header (the Message-ID being replied to). Normally set automatically via replyToMessageId."),
       references: z.string().optional().describe("Manual References header (space-separated Message-IDs). Normally set automatically via replyToMessageId.")
