@@ -1001,15 +1001,19 @@ function createServer({ config }: { config?: Record<string, any> }) {
 
         const bytes = Buffer.from(data.data || '', 'base64url')
 
-        // Resolve filename/mimeType from the message MIME tree (walked server-side, not returned).
-        let filename: string | undefined
+        // Prefer the caller-chosen savePath for the name; only walk the message tree when we
+        // must invent a temp-file name. (Gmail regenerates attachmentIds per fetch, so the
+        // tree lookup is best-effort and may miss — hence the savePath-first order.)
+        let filename = params.savePath ? path.basename(params.savePath) : undefined
         let mimeType: string | undefined
-        try {
-          const { data: msg } = await gmail.users.messages.get({ userId: 'me', id: params.messageId, format: 'full' })
-          const part = findPartByAttachmentId(msg.payload ?? undefined, params.id)
-          filename = part?.filename ?? undefined
-          mimeType = part?.mimeType ?? undefined
-        } catch { /* best-effort; fall back to defaults below */ }
+        if (!filename) {
+          try {
+            const { data: msg } = await gmail.users.messages.get({ userId: 'me', id: params.messageId, format: 'full' })
+            const part = findPartByAttachmentId(msg.payload ?? undefined, params.id)
+            filename = part?.filename ?? undefined
+            mimeType = part?.mimeType ?? undefined
+          } catch { /* best-effort; fall back to defaults below */ }
+        }
 
         const safeName = (filename || `${params.id.slice(0, 16)}.bin`).replace(/[/\\]/g, '_')
         const outPath = params.savePath || path.join(os.tmpdir(), 'gmail-mcp-attachments', `${params.messageId}-${safeName}`)
