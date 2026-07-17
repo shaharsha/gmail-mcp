@@ -6,6 +6,9 @@ import { createStatefulServer } from "@smithery/sdk/server/stateful.js"
 import { z } from "zod"
 import { google, gmail_v1 } from 'googleapis'
 import fs from "fs"
+import os from "os"
+import path from "path"
+import crypto from "crypto"
 import { createOAuth2Client, launchAuthServer, validateCredentials } from "./oauth2.js"
 import { MCP_CONFIG_DIR, PORT, TELEMETRY_ENABLED } from "./config.js"
 import { instrumentServer } from "@shinzolabs/instrumentation-mcp"
@@ -193,11 +196,6 @@ const deriveReply = (msgHeaders: MessagePartHeader[]) => {
   }
 }
 
-const wrapTextBody = (text: string): string => text.split('\n').map(line => {
-  if (line.length <= 76) return line
-  const chunks = line.match(/.{1,76}/g) || []
-  return chunks.join('=\n')
-}).join('\n')
 
 // Strip CR/LF from header values to prevent RFC822 header injection via user-controlled fields.
 const sanitizeHeaderValue = (value: string) => value.replace(/[\r\n]+/g, ' ').trim()
@@ -260,6 +258,33 @@ const findPartByMime = (part: MessagePart | undefined, mimeType: string): Messag
   return undefined
 }
 
+// Depth-first search for the part carrying a given attachment id.
+const findPartByAttachmentId = (part: MessagePart | undefined, attachmentId: string): MessagePart | undefined => {
+  if (!part) return undefined
+  if (part.body?.attachmentId === attachmentId) return part
+  for (const sub of part.parts || []) {
+    const found = findPartByAttachmentId(sub, attachmentId)
+    if (found) return found
+  }
+  return undefined
+}
+
+// Compact manifest of a message's real attachments (parts with both a filename and an attachmentId).
+type AttachmentInfo = { id: string; filename: string; mimeType?: string; size?: number }
+const collectAttachments = (part?: MessagePart): AttachmentInfo[] => {
+  const out: AttachmentInfo[] = []
+  const walk = (p?: MessagePart) => {
+    if (!p) return
+    const attachmentId = p.body?.attachmentId
+    if (p.filename && attachmentId) {
+      out.push({ id: attachmentId, filename: p.filename, mimeType: p.mimeType ?? undefined, size: p.body?.size ?? undefined })
+    }
+    p.parts?.forEach(walk)
+  }
+  walk(part)
+  return out
+}
+
 const MIME_TYPES: Record<string, string> = {
   pdf: 'application/pdf', txt: 'text/plain', csv: 'text/csv', json: 'application/json',
   html: 'text/html', htm: 'text/html', xml: 'application/xml', zip: 'application/zip',
@@ -307,11 +332,13 @@ const buildAttachmentPart = (attachment: Attachment, boundary: string): string =
 
 const wrapBase64 = (base64: string) => (base64.replace(/\s+/g, '').match(/.{1,76}/g) || []).join('\r\n')
 
+// Base64 (not quoted-printable) so non-ASCII bodies (Hebrew/Arabic) survive intact —
+// a QP label over raw UTF-8 bytes mojibakes in strict clients.
 const buildTextPart = (text: string) => [
   'Content-Type: text/plain; charset="UTF-8"',
-  'Content-Transfer-Encoding: quoted-printable',
+  'Content-Transfer-Encoding: base64',
   '',
-  text
+  wrapBase64(Buffer.from(text, 'utf-8').toString('base64'))
 ]
 
 const buildHtmlPart = (html: string) => [
@@ -368,14 +395,15 @@ const constructRawMessage = async (gmail: gmail_v1.Gmail, params: NewMessage) =>
   headers.push('MIME-Version: 1.0')
 
   // Plain-text body (+ quoted reply history for threads).
+  // Raw text with real newlines; the part is base64-encoded (buildTextPart), so no QP line-wrapping.
   const bodyParts: string[] = []
-  if (params.body) bodyParts.push(wrapTextBody(params.body))
-  else if (params.htmlBody !== undefined) bodyParts.push(wrapTextBody(htmlToPlainText(params.htmlBody)))
+  if (params.body) bodyParts.push(params.body)
+  else if (params.htmlBody !== undefined) bodyParts.push(htmlToPlainText(params.htmlBody))
   if (thread && !params.skipQuotedContent) {
     const quotedContent = getQuotedContent(thread)
     if (quotedContent) {
       bodyParts.push('')
-      bodyParts.push(wrapTextBody(quotedContent))
+      bodyParts.push(quotedContent)
     }
   }
   const textBody = bodyParts.join('\r\n')
@@ -615,26 +643,28 @@ function createServer({ config }: { config?: Record<string, any> }) {
         if (params.subject === undefined) params.subject = findHeader(payload?.headers || [], 'subject') ?? undefined
         if (params.inReplyTo === undefined) params.inReplyTo = findHeader(payload?.headers || [], 'in-reply-to') ?? undefined
         if (params.references === undefined) params.references = findHeader(payload?.headers || [], 'references') ?? undefined
-        if (params.body === undefined) {
-          const bodyData = findPartByMime(payload, 'text/plain')?.body?.data ?? payload?.body?.data
-          if (bodyData) params.body = Buffer.from(bodyData, 'base64url').toString('utf-8')
-          // The preserved body already contains any quoted reply history; don't let constructRawMessage re-append it.
+        // Keep text/plain in sync with the HTML — never let the stored plain part go stale.
+        // HTML is the source of truth: when it changes (or on a metadata-only edit) the
+        // plain part is regenerated from it by constructRawMessage rather than preserved.
+        const htmlData = findPartByMime(payload, 'text/html')?.body?.data
+        const oldHtml = htmlData ? Buffer.from(htmlData, 'base64url').toString('utf-8') : undefined
+        if (params.body === undefined && params.htmlBody === undefined) {
+          if (oldHtml) {
+            params.htmlBody = oldHtml // regenerates a fresh text/plain part; preserves the alternative shape
+          } else {
+            const bodyData = findPartByMime(payload, 'text/plain')?.body?.data ?? payload?.body?.data
+            if (bodyData) params.body = Buffer.from(bodyData, 'base64url').toString('utf-8')
+          }
+          // The preserved/derived content already reflects any quoted reply history; don't re-append it.
           params.skipQuotedContent = true
         }
         if (!params.attachments) {
-          const existing: { filename: string; mimeType?: string; attachmentId: string }[] = []
-          const collectAttachments = (part?: MessagePart) => {
-            if (!part) return
-            const attachmentId = part.body?.attachmentId
-            if (part.filename && attachmentId) existing.push({ filename: part.filename, mimeType: part.mimeType ?? undefined, attachmentId })
-            part.parts?.forEach(collectAttachments)
-          }
-          collectAttachments(payload)
+          const existing = collectAttachments(payload ?? undefined)
           const messageId = currentDraft.data.message?.id
           if (existing.length && messageId) {
             params.attachments = []
             for (const att of existing) {
-              const { data: attData } = await gmail.users.messages.attachments.get({ userId: 'me', messageId, id: att.attachmentId })
+              const { data: attData } = await gmail.users.messages.attachments.get({ userId: 'me', messageId, id: att.id })
               if (attData.data) params.attachments.push({ filename: att.filename, mimeType: att.mimeType, content: attData.data })
             }
           }
@@ -804,13 +834,27 @@ function createServer({ config }: { config?: Record<string, any> }) {
     "Get a specific message by ID with format options",
     {
       id: z.string().describe("The ID of the message to retrieve"),
-      format: z.enum(['full', 'metadata', 'minimal']).optional().describe("Gmail fetch format. 'full' (default) returns the parsed body; 'metadata' returns headers only (pair with metadataHeaders) and is far smaller; 'minimal' returns only ids/labels."),
+      format: z.enum(['full', 'metadata', 'minimal', 'text']).optional().describe("Fetch format. 'full' (default) returns the parsed body; 'metadata' returns headers only (pair with metadataHeaders) and is far smaller; 'minimal' returns only ids/labels; 'text' is agent-friendly — headers + decoded plain-text body + a compact attachment manifest, no base64/HTML."),
       metadataHeaders: z.array(z.string()).optional().describe("When format is 'metadata', restrict the returned headers to these names, e.g. ['Subject','Message-ID','From']."),
       includeBodyHtml: z.boolean().optional().describe("Whether to include the parsed HTML in the return for each body, excluded by default because they can be excessively large")
     },
     async (params) => {
       return handleTool(config, async (gmail: gmail_v1.Gmail) => {
         const format = params.format ?? 'full'
+
+        // 'text' is a synthetic, agent-friendly format: fetch full, then reduce to the small
+        // stuff a model actually reads. Keeps rich HTML/image emails from blowing up context.
+        if (format === 'text') {
+          const { data } = await gmail.users.messages.get({ userId: 'me', id: params.id, format: 'full' })
+          const headers = (data.payload?.headers || []).filter(h => RESPONSE_HEADERS_LIST.includes(h.name || ''))
+          const textData = findPartByMime(data.payload ?? undefined, 'text/plain')?.body?.data ?? data.payload?.body?.data
+          const text = textData ? Buffer.from(textData, 'base64url').toString('utf-8') : ''
+          return formatResponse({
+            id: data.id, threadId: data.threadId, labelIds: data.labelIds, snippet: data.snippet,
+            headers, text, attachments: collectAttachments(data.payload ?? undefined)
+          })
+        }
+
         const { data } = await gmail.users.messages.get({ userId: 'me', id: params.id, format, metadataHeaders: params.metadataHeaders })
 
         if (format === 'full' && data.payload) {
@@ -942,15 +986,51 @@ function createServer({ config }: { config?: Record<string, any> }) {
   )
 
   server.tool("get_attachment",
-    "Get a message attachment",
+    "Get a message attachment. By default writes the raw bytes to a file and returns {path, filename, mimeType, size, sha256} so the caller can open it with a real parser — base64 binaries are unusable in-context. Pass inline:true to instead receive base64 in the response (rare; small text-like parts only). Get the attachment id from list_attachments.",
     {
       messageId: z.string().describe("ID of the message containing the attachment"),
-      id: z.string().describe("The ID of the attachment"),
+      id: z.string().describe("The ID of the attachment (from list_attachments or the message MIME tree)"),
+      savePath: z.string().optional().describe("Absolute path to write the decoded bytes to. If omitted, a temp file under the OS temp dir is used. Ignored when inline is true."),
+      inline: z.boolean().optional().describe("Return base64 {size, data} in the response instead of writing a file. Default false. Only for small text-like attachments the model must read directly.")
     },
     async (params) => {
       return handleTool(config, async (gmail: gmail_v1.Gmail) => {
         const { data } = await gmail.users.messages.attachments.get({ userId: 'me', messageId: params.messageId, id: params.id })
-        return formatResponse(data)
+
+        if (params.inline) return formatResponse(data)
+
+        const bytes = Buffer.from(data.data || '', 'base64url')
+
+        // Resolve filename/mimeType from the message MIME tree (walked server-side, not returned).
+        let filename: string | undefined
+        let mimeType: string | undefined
+        try {
+          const { data: msg } = await gmail.users.messages.get({ userId: 'me', id: params.messageId, format: 'full' })
+          const part = findPartByAttachmentId(msg.payload ?? undefined, params.id)
+          filename = part?.filename ?? undefined
+          mimeType = part?.mimeType ?? undefined
+        } catch { /* best-effort; fall back to defaults below */ }
+
+        const safeName = (filename || `${params.id.slice(0, 16)}.bin`).replace(/[/\\]/g, '_')
+        const outPath = params.savePath || path.join(os.tmpdir(), 'gmail-mcp-attachments', `${params.messageId}-${safeName}`)
+        fs.mkdirSync(path.dirname(outPath), { recursive: true })
+        fs.writeFileSync(outPath, bytes)
+        const sha256 = crypto.createHash('sha256').update(bytes).digest('hex')
+
+        return formatResponse({ path: outPath, filename: filename ?? safeName, mimeType: mimeType ?? guessMimeType(safeName), size: bytes.length, sha256 })
+      })
+    }
+  )
+
+  server.tool("list_attachments",
+    "List a message's attachments as a compact array of {id, filename, mimeType, size} — no MIME-tree walking, no base64. Feed an id into get_attachment.",
+    {
+      messageId: z.string().describe("ID of the message to list attachments for")
+    },
+    async (params) => {
+      return handleTool(config, async (gmail: gmail_v1.Gmail) => {
+        const { data } = await gmail.users.messages.get({ userId: 'me', id: params.messageId, format: 'full' })
+        return formatResponse({ messageId: params.messageId, attachments: collectAttachments(data.payload ?? undefined) })
       })
     }
   )

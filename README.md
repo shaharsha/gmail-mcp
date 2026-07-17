@@ -133,8 +133,9 @@ pnpm i && pnpm build
 
 #### Managing Messages
 - `list_messages`: List messages with optional filtering
-- `get_message`: Get a specific message
-- `get_attachment`: Get a message attachment
+- `get_message`: Get a specific message (`format`: `full` | `metadata` | `minimal` | `text`; `text` returns headers + decoded plain-text body + an attachment manifest, no base64/HTML)
+- `list_attachments`: List a message's attachments as a compact `{id, filename, mimeType, size}` array
+- `get_attachment`: Get a message attachment. **By default writes the decoded bytes to a file** and returns `{path, filename, mimeType, size, sha256}` (pass `savePath` to choose the location). Pass `inline: true` to instead receive base64 in the response. **Breaking change** from prior versions, which always returned base64.
 - `modify_message`: Modify message labels
 - `send_message`: Send an email message to specified recipients
 - `delete_message`: Permanently delete a message
@@ -163,7 +164,7 @@ pnpm i && pnpm build
 - `list_drafts`: List drafts in the user's mailbox
 - `get_draft`: Get a specific draft by ID
 - `create_draft`: Create a draft email in Gmail
-- `update_draft`: Replace a draft's content
+- `update_draft`: Replace a draft's content (keeps the `text/plain` part in sync with `htmlBody` — updating only `htmlBody` regenerates the plain part instead of leaving it stale, and metadata-only edits no longer strip the HTML part)
 - `delete_draft`: Delete a draft
 - `send_draft`: Send an existing draft
 
