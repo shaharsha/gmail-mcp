@@ -15,7 +15,8 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/introduction) s
 ## Features
 
 - Complete Gmail API coverage including messages, threads, labels, drafts, and settings
-- Support for sending, drafting, and managing emails
+- Support for sending, drafting, and managing emails, including HTML/RTL bodies and inline (in-body) `cid` images
+- Attachment handling built for agents: `list_attachments` manifest, and `get_attachment` that saves bytes to a file (or returns an image as a viewable block) instead of dumping base64
 - Label management with customizable colors and visibility settings
 - Thread operations for conversation management
 - Settings management including vacation responder, IMAP/POP, and language settings
@@ -137,7 +138,7 @@ pnpm i && pnpm build
 - `list_attachments`: List every embedded part (attachments AND inline images, even filename-less ones) as a compact `{id, filename, mimeType, size, inline?, contentId?}` array
 - `get_attachment`: Get a message attachment. **By default writes the decoded bytes to a file** and returns `{path, filename, mimeType, size, sha256}` (pass `savePath` to choose the location). Pass `perceive: true` to instead receive an image as a viewable content block the model can see (charts/screenshots/photos; size-capped). Pass `inline: true` for raw base64. **Breaking change** from prior versions, which always returned base64.
 - `modify_message`: Modify message labels
-- `send_message`: Send an email message to specified recipients
+- `send_message`: Send an email message to specified recipients (irreversible; supports `htmlBody` for HTML/RTL, file `attachments`, and inline in-body images — same content params as `create_draft`)
 - `delete_message`: Permanently delete a message
 - `trash_message`: Move message to trash
 - `untrash_message`: Remove message from trash
@@ -163,7 +164,7 @@ pnpm i && pnpm build
 ### Draft Management
 - `list_drafts`: List drafts in the user's mailbox
 - `get_draft`: Get a specific draft by ID
-- `create_draft`: Create a draft email in Gmail
+- `create_draft`: Create a draft email in Gmail. Supports `htmlBody` (HTML/RTL), file `attachments`, and inline in-body images — set `inline: true` + `contentId` on an attachment and reference it from `htmlBody` as `<img src="cid:THAT_ID">` (emitted as `multipart/related`)
 - `update_draft`: Replace a draft's content (keeps the `text/plain` part in sync with `htmlBody` — updating only `htmlBody` regenerates the plain part instead of leaving it stale, and metadata-only edits no longer strip the HTML part)
 - `delete_draft`: Delete a draft
 - `send_draft`: Send an existing draft
