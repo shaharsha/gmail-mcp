@@ -134,8 +134,8 @@ pnpm i && pnpm build
 #### Managing Messages
 - `list_messages`: List messages with optional filtering
 - `get_message`: Get a specific message (`format`: `full` | `metadata` | `minimal` | `text`; `text` returns headers + decoded plain-text body + an attachment manifest, no base64/HTML)
-- `list_attachments`: List a message's attachments as a compact `{id, filename, mimeType, size}` array
-- `get_attachment`: Get a message attachment. **By default writes the decoded bytes to a file** and returns `{path, filename, mimeType, size, sha256}` (pass `savePath` to choose the location). Pass `inline: true` to instead receive base64 in the response. **Breaking change** from prior versions, which always returned base64.
+- `list_attachments`: List every embedded part (attachments AND inline images, even filename-less ones) as a compact `{id, filename, mimeType, size, inline?, contentId?}` array
+- `get_attachment`: Get a message attachment. **By default writes the decoded bytes to a file** and returns `{path, filename, mimeType, size, sha256}` (pass `savePath` to choose the location). Pass `perceive: true` to instead receive an image as a viewable content block the model can see (charts/screenshots/photos; size-capped). Pass `inline: true` for raw base64. **Breaking change** from prior versions, which always returned base64.
 - `modify_message`: Modify message labels
 - `send_message`: Send an email message to specified recipients
 - `delete_message`: Permanently delete a message

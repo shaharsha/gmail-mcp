@@ -29,6 +29,7 @@ type Attachment = {
   content?: string
   path?: string
   inline?: boolean
+  contentId?: string
 }
 
 type NewMessage = {
@@ -120,7 +121,10 @@ const processMessagePart = (messagePart: MessagePart, includeBodyHtml = false): 
   }
 
   if (messagePart.headers) {
-    messagePart.headers = messagePart.headers.filter(header => RESPONSE_HEADERS_LIST.includes(header.name || ''))
+    // Keep the top-level address/subject headers, plus the per-part MIME headers needed to
+    // introspect structure (Content-Type) and inline images (Content-ID/Content-Disposition).
+    messagePart.headers = messagePart.headers.filter(header =>
+      RESPONSE_HEADERS_LIST.includes(header.name || '') || /^content-(type|id|disposition)$/i.test(header.name || ''))
   }
 
   return messagePart
@@ -270,19 +274,44 @@ const findPartByAttachmentId = (part: MessagePart | undefined, attachmentId: str
 }
 
 // Compact manifest of a message's real attachments (parts with both a filename and an attachmentId).
-type AttachmentInfo = { id: string; filename: string; mimeType?: string; size?: number }
+type AttachmentInfo = { id: string; filename: string; mimeType?: string; size?: number; inline?: boolean; contentId?: string }
+const partHeader = (p: MessagePart, name: string) =>
+  (p.headers || []).find(h => (h.name || '').toLowerCase() === name)?.value ?? undefined
+const extForMime = (mime?: string) =>
+  mime?.startsWith('image/') ? '.' + mime.split('/')[1].replace('+xml', '') : (mime === 'application/pdf' ? '.pdf' : '.bin')
+
+// Every part that carries bytes (has an attachmentId) — including inline images with no filename,
+// which are synthesized from their Content-ID/index so nothing embedded is undiscoverable.
 const collectAttachments = (part?: MessagePart): AttachmentInfo[] => {
   const out: AttachmentInfo[] = []
+  let i = 0
   const walk = (p?: MessagePart) => {
     if (!p) return
     const attachmentId = p.body?.attachmentId
-    if (p.filename && attachmentId) {
-      out.push({ id: attachmentId, filename: p.filename, mimeType: p.mimeType ?? undefined, size: p.body?.size ?? undefined })
+    if (attachmentId) {
+      const cid = (partHeader(p, 'content-id') || '').replace(/^<|>$/g, '') || undefined
+      const disposition = partHeader(p, 'content-disposition') || ''
+      const inline = /inline/i.test(disposition) || (!!cid && !/attachment/i.test(disposition))
+      const filename = p.filename || `${cid || `part-${i}`}${extForMime(p.mimeType ?? undefined)}`
+      out.push({
+        id: attachmentId, filename, mimeType: p.mimeType ?? undefined, size: p.body?.size ?? undefined,
+        ...(inline ? { inline: true } : {}), ...(cid ? { contentId: cid } : {})
+      })
+      i++
     }
     p.parts?.forEach(walk)
   }
   walk(part)
   return out
+}
+
+// Dependency-free image type sniff from magic bytes, for perceivable attachment returns.
+const sniffImageMime = (b: Buffer): string | undefined => {
+  if (b.length > 8 && b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47) return 'image/png'
+  if (b.length > 3 && b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return 'image/jpeg'
+  if (b.length > 3 && b[0] === 0x47 && b[1] === 0x49 && b[2] === 0x46) return 'image/gif'
+  if (b.length > 12 && b.toString('ascii', 0, 4) === 'RIFF' && b.toString('ascii', 8, 12) === 'WEBP') return 'image/webp'
+  return undefined
 }
 
 const MIME_TYPES: Record<string, string> = {
@@ -310,6 +339,11 @@ const encodeHeaderFilename = (key: string, filename: string) =>
     ? `${key}="${filename.replace(/"/g, '')}"`
     : `${key}*=UTF-8''${encodeURIComponent(filename)}`
 
+// Content-ID for an inline part. Defaults to the filename so `<img src="cid:filename">` works
+// without the caller having to invent an id. Strips angle brackets/whitespace (header-unsafe).
+const contentIdFor = (attachment: Attachment, filename: string) =>
+  (attachment.contentId || filename).replace(/[<>\s\r\n]/g, '')
+
 const buildAttachmentPart = (attachment: Attachment, boundary: string): string => {
   const filename = attachment.filename || (attachment.path ? attachment.path.split('/').pop()! : 'attachment')
   const mimeType = attachment.mimeType || guessMimeType(filename)
@@ -320,14 +354,16 @@ const buildAttachmentPart = (attachment: Attachment, boundary: string): string =
   while (base64.length % 4) base64 += '='
   const wrapped = (base64.match(/.{1,76}/g) || []).join('\r\n')
   const disposition = attachment.inline ? 'inline' : 'attachment'
-  return [
+  const lines = [
     `--${boundary}`,
     `Content-Type: ${mimeType}; ${encodeHeaderFilename('name', filename)}`,
     'Content-Transfer-Encoding: base64',
-    `Content-Disposition: ${disposition}; ${encodeHeaderFilename('filename', filename)}`,
-    '',
-    wrapped
-  ].join('\r\n')
+    `Content-Disposition: ${disposition}; ${encodeHeaderFilename('filename', filename)}`
+  ]
+  // Inline parts carry a Content-ID so the HTML can reference them as <img src="cid:...">.
+  if (attachment.inline) lines.push(`Content-ID: <${contentIdFor(attachment, filename)}>`)
+  lines.push('', wrapped)
+  return lines.join('\r\n')
 }
 
 const wrapBase64 = (base64: string) => (base64.replace(/\s+/g, '').match(/.{1,76}/g) || []).join('\r\n')
@@ -424,16 +460,37 @@ const constructRawMessage = async (gmail: gmail_v1.Gmail, params: NewMessage) =>
     inner = buildTextPart(textBody)
   }
 
-  // Wrap in multipart/mixed when there are attachments.
+  // Split attachments: inline images (referenced from the HTML via cid:) belong in a
+  // multipart/related wrapper around the body; everything else is a regular attachment in
+  // the outer multipart/mixed. Inline only applies when there's HTML to reference them from.
+  const allAtts = params.attachments ?? []
+  const inlineAtts = params.htmlBody !== undefined ? allAtts.filter(a => a.inline) : []
+  const regularAtts = allAtts.filter(a => !inlineAtts.includes(a))
+
+  // multipart/related wraps the alternative + the inline image parts so <img src="cid:..."> resolves.
+  let content: string[]
+  if (inlineAtts.length) {
+    const relBoundary = `----=_Rel_${rand()}`
+    content = [
+      `Content-Type: multipart/related; type="multipart/alternative"; boundary="${relBoundary}"`, '',
+      `--${relBoundary}`, ...inner,
+      ...inlineAtts.map(a => buildAttachmentPart(a, relBoundary)),
+      `--${relBoundary}--`
+    ]
+  } else {
+    content = inner
+  }
+
+  // Wrap in multipart/mixed when there are regular (non-inline) attachments.
   const message: string[] = [...headers]
-  if (params.attachments?.length) {
+  if (regularAtts.length) {
     const mixedBoundary = `----=_Mixed_${rand()}`
     message.push(`Content-Type: multipart/mixed; boundary="${mixedBoundary}"`, '')
-    message.push(`--${mixedBoundary}`, ...inner)
-    for (const attachment of params.attachments) message.push(buildAttachmentPart(attachment, mixedBoundary))
+    message.push(`--${mixedBoundary}`, ...content)
+    for (const attachment of regularAtts) message.push(buildAttachmentPart(attachment, mixedBoundary))
     message.push(`--${mixedBoundary}--`)
   } else {
-    message.push(...inner)
+    message.push(...content)
   }
 
   return Buffer.from(message.join('\r\n')).toString('base64url').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
@@ -465,7 +522,7 @@ function createServer({ config }: { config?: Record<string, any> }) {
   }
 
   server.tool("create_draft",
-    "Create a draft email in Gmail. Prefer the structured params: to/cc/subject plus htmlBody (HTML/RTL) or body (plain text); use raw only for a pre-built MIME message.",
+    "Create (save) a draft in Gmail without sending it — returns {id, message:{id, threadId}}. To send immediately instead, use send_message; to send this draft later, use send_draft. Prefer the structured params: to/cc/subject plus htmlBody (HTML/RTL) or body (plain text); use raw only for a pre-built MIME message.",
     {
       raw: z.string().optional().describe("ADVANCED / last resort: prefer to, cc, subject, body, and htmlBody instead. A pre-built entire email in base64url-encoded RFC 2822 format; when provided it overrides to, cc, bcc, subject, body, htmlBody, and includeBodyHtml. Do NOT hand-build this: it bypasses the server's RTL/HTML and header handling and bloats the conversation transcript with a large opaque blob."),
       threadId: z.string().optional().describe("The thread ID to associate this draft with"),
@@ -480,7 +537,8 @@ function createServer({ config }: { config?: Record<string, any> }) {
         mimeType: z.string().optional().describe("MIME type, e.g. application/pdf. Inferred from the filename extension if omitted."),
         content: z.string().optional().describe("Base64-encoded file content. Provide either content or path; prefer path for large files to keep requests small."),
         path: z.string().optional().describe("Local filesystem path for the server to read and attach. Provide either path or content."),
-        inline: z.boolean().optional().describe("Attach inline (e.g. an image referenced from HTML) rather than as a downloadable file. Defaults to false.")
+        inline: z.boolean().optional().describe("Embed this part in the message body instead of adding it as a downloadable attachment. For an in-body image: set inline:true, give it a contentId, and reference it from htmlBody as <img src=\"cid:THAT_ID\">. Requires htmlBody. Defaults to false."),
+        contentId: z.string().optional().describe("Content-ID for an inline part, referenced from htmlBody as <img src=\"cid:VALUE\">. Defaults to the filename when omitted. Only used when inline is true.")
       })).optional().describe("Files to attach to the message"),
       htmlBody: z.string().optional().describe("HTML body. When set, the message is sent as multipart/alternative; the plain-text part comes from body, or is auto-generated from the HTML when body is omitted. For right-to-left languages (Hebrew/Arabic) wrap the content in <div dir=\"rtl\" style=\"text-align:right\">...</div> so it renders right-aligned."),
       replyToMessageId: z.string().optional().describe("Message ID being replied to. Auto-populates In-Reply-To/References, the thread association, and a Re: subject (each overridable by the matching explicit param)."),
@@ -623,7 +681,8 @@ function createServer({ config }: { config?: Record<string, any> }) {
         mimeType: z.string().optional().describe("MIME type, e.g. application/pdf. Inferred from the filename extension if omitted."),
         content: z.string().optional().describe("Base64-encoded file content. Provide either content or path; prefer path for large files to keep requests small."),
         path: z.string().optional().describe("Local filesystem path for the server to read and attach. Provide either path or content."),
-        inline: z.boolean().optional().describe("Attach inline (e.g. an image referenced from HTML) rather than as a downloadable file. Defaults to false.")
+        inline: z.boolean().optional().describe("Embed this part in the message body instead of adding it as a downloadable attachment. For an in-body image: set inline:true, give it a contentId, and reference it from htmlBody as <img src=\"cid:THAT_ID\">. Requires htmlBody. Defaults to false."),
+        contentId: z.string().optional().describe("Content-ID for an inline part, referenced from htmlBody as <img src=\"cid:VALUE\">. Defaults to the filename when omitted. Only used when inline is true.")
       })).optional().describe("Files to attach to the message"),
       htmlBody: z.string().optional().describe("HTML body. When set, the message is sent as multipart/alternative; the plain-text part comes from body, or is auto-generated from the HTML when body is omitted. For right-to-left languages (Hebrew/Arabic) wrap the content in <div dir=\"rtl\" style=\"text-align:right\">...</div> so it renders right-aligned."),
       replyToMessageId: z.string().optional().describe("Message ID being replied to. Auto-populates In-Reply-To/References, the thread association, and a Re: subject (each overridable by the matching explicit param)."),
@@ -842,10 +901,19 @@ function createServer({ config }: { config?: Record<string, any> }) {
       return handleTool(config, async (gmail: gmail_v1.Gmail) => {
         const format = params.format ?? 'full'
 
+        // Add a hint on the opaque 404 you get when the id is actually a draft's message id.
+        const getMessage = async (opts: any) => {
+          try { return await gmail.users.messages.get(opts) }
+          catch (e: any) {
+            if (/not found/i.test(e?.message || '')) throw new Error(`${e.message} (if this id belongs to a draft, use get_draft instead)`)
+            throw e
+          }
+        }
+
         // 'text' is a synthetic, agent-friendly format: fetch full, then reduce to the small
         // stuff a model actually reads. Keeps rich HTML/image emails from blowing up context.
         if (format === 'text') {
-          const { data } = await gmail.users.messages.get({ userId: 'me', id: params.id, format: 'full' })
+          const { data } = await getMessage({ userId: 'me', id: params.id, format: 'full' })
           const headers = (data.payload?.headers || []).filter(h => RESPONSE_HEADERS_LIST.includes(h.name || ''))
           const textData = findPartByMime(data.payload ?? undefined, 'text/plain')?.body?.data ?? data.payload?.body?.data
           const text = textData ? Buffer.from(textData, 'base64url').toString('utf-8') : ''
@@ -855,7 +923,7 @@ function createServer({ config }: { config?: Record<string, any> }) {
           })
         }
 
-        const { data } = await gmail.users.messages.get({ userId: 'me', id: params.id, format, metadataHeaders: params.metadataHeaders })
+        const { data } = await getMessage({ userId: 'me', id: params.id, format, metadataHeaders: params.metadataHeaders })
 
         if (format === 'full' && data.payload) {
           data.payload = processMessagePart(data.payload, params.includeBodyHtml)
@@ -913,7 +981,7 @@ function createServer({ config }: { config?: Record<string, any> }) {
   )
 
   server.tool("send_message",
-    "Send an email message to specified recipients. Prefer the structured params: to/cc/subject plus htmlBody (HTML/RTL) or body (plain text); use raw only for a pre-built MIME message.",
+    "Send an email immediately — IRREVERSIBLE, there is no unsend. To save a draft without sending, use create_draft; to send a draft that already exists, use send_draft. Prefer the structured params: to/cc/subject plus htmlBody (HTML/RTL) or body (plain text); use raw only for a pre-built MIME message. Returns the sent message {id, threadId, labelIds}.",
     {
       raw: z.string().optional().describe("ADVANCED / last resort: prefer to, cc, subject, body, and htmlBody instead. A pre-built entire email in base64url-encoded RFC 2822 format; when provided it overrides to, cc, bcc, subject, body, htmlBody, and includeBodyHtml. Do NOT hand-build this: it bypasses the server's RTL/HTML and header handling and bloats the conversation transcript with a large opaque blob."),
       threadId: z.string().optional().describe("The thread ID to associate this message with"),
@@ -928,7 +996,8 @@ function createServer({ config }: { config?: Record<string, any> }) {
         mimeType: z.string().optional().describe("MIME type, e.g. application/pdf. Inferred from the filename extension if omitted."),
         content: z.string().optional().describe("Base64-encoded file content. Provide either content or path; prefer path for large files to keep requests small."),
         path: z.string().optional().describe("Local filesystem path for the server to read and attach. Provide either path or content."),
-        inline: z.boolean().optional().describe("Attach inline (e.g. an image referenced from HTML) rather than as a downloadable file. Defaults to false.")
+        inline: z.boolean().optional().describe("Embed this part in the message body instead of adding it as a downloadable attachment. For an in-body image: set inline:true, give it a contentId, and reference it from htmlBody as <img src=\"cid:THAT_ID\">. Requires htmlBody. Defaults to false."),
+        contentId: z.string().optional().describe("Content-ID for an inline part, referenced from htmlBody as <img src=\"cid:VALUE\">. Defaults to the filename when omitted. Only used when inline is true.")
       })).optional().describe("Files to attach to the message"),
       htmlBody: z.string().optional().describe("HTML body. When set, the message is sent as multipart/alternative; the plain-text part comes from body, or is auto-generated from the HTML when body is omitted. For right-to-left languages (Hebrew/Arabic) wrap the content in <div dir=\"rtl\" style=\"text-align:right\">...</div> so it renders right-aligned."),
       replyToMessageId: z.string().optional().describe("Message ID being replied to. Auto-populates In-Reply-To/References, the thread association, and a Re: subject (each overridable by the matching explicit param)."),
@@ -986,12 +1055,13 @@ function createServer({ config }: { config?: Record<string, any> }) {
   )
 
   server.tool("get_attachment",
-    "Get a message attachment. By default writes the raw bytes to a file and returns {path, filename, mimeType, size, sha256} so the caller can open it with a real parser — base64 binaries are unusable in-context. Pass inline:true to instead receive base64 in the response (rare; small text-like parts only). Get the attachment id from list_attachments.",
+    "Get a message attachment. Default: writes the raw bytes to a file and returns {path, filename, mimeType, size, sha256} so the caller can open it with a real parser. Pass perceive:true to instead SEE an image (returned as a viewable image block — for charts/screenshots/photos). Pass inline:true for raw base64 (rare; small text parts). Get the attachment id from list_attachments.",
     {
       messageId: z.string().describe("ID of the message containing the attachment"),
       id: z.string().describe("The ID of the attachment (from list_attachments or the message MIME tree)"),
-      savePath: z.string().optional().describe("Absolute path to write the decoded bytes to. If omitted, a temp file under the OS temp dir is used. Ignored when inline is true."),
-      inline: z.boolean().optional().describe("Return base64 {size, data} in the response instead of writing a file. Default false. Only for small text-like attachments the model must read directly.")
+      savePath: z.string().optional().describe("Absolute path to write the decoded bytes to. If omitted, a temp file under the OS temp dir is used. Ignored when inline/perceive returns instead."),
+      inline: z.boolean().optional().describe("Return base64 {size, data} in the response instead of writing a file. Default false. Only for small text-like attachments the model must read directly."),
+      perceive: z.boolean().optional().describe("Return the attachment as a viewable image content block so the model can SEE it (images only). Falls back to writing a file for non-images or oversized images. Use to read a chart/screenshot/photo embedded in an email.")
     },
     async (params) => {
       return handleTool(config, async (gmail: gmail_v1.Gmail) => {
@@ -1000,6 +1070,16 @@ function createServer({ config }: { config?: Record<string, any> }) {
         if (params.inline) return formatResponse(data)
 
         const bytes = Buffer.from(data.data || '', 'base64url')
+
+        // perceive: hand the model a viewable image block (only for real, not-too-large images).
+        if (params.perceive) {
+          const imgMime = sniffImageMime(bytes)
+          const MAX_PERCEIVE = 1_500_000 // ~1.5 MB raw; larger images go to a file to protect context
+          if (imgMime && bytes.length <= MAX_PERCEIVE) {
+            return { content: [{ type: "image" as const, data: bytes.toString('base64'), mimeType: imgMime }] }
+          }
+          // otherwise fall through to the file path below (non-image or too large to inline)
+        }
 
         // Prefer the caller-chosen savePath for the name; only walk the message tree when we
         // must invent a temp-file name. (Gmail regenerates attachmentIds per fetch, so the
@@ -1027,7 +1107,7 @@ function createServer({ config }: { config?: Record<string, any> }) {
   )
 
   server.tool("list_attachments",
-    "List a message's attachments as a compact array of {id, filename, mimeType, size} — no MIME-tree walking, no base64. Feed an id into get_attachment.",
+    "List every embedded part of a message (attachments AND inline images, even ones with no filename) as a compact array of {id, filename, mimeType, size, inline?, contentId?} — no MIME-tree walking, no base64. Feed an id into get_attachment (use perceive:true there to view an image).",
     {
       messageId: z.string().describe("ID of the message to list attachments for")
     },
