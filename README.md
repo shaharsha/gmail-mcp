@@ -10,6 +10,18 @@
 
 A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/introduction) server implementation for the [Gmail](https://developers.google.com/gmail/api) API, providing a standardized interface for email management, sending, and retrieval.
 
+### About this fork
+
+A patched fork of [shinzo-labs/gmail-mcp](https://github.com/shinzo-labs/gmail-mcp) with agent-focused composing and attachment handling. Notable additions over upstream:
+
+- Compose with `htmlBody` (HTML/RTL), file `attachments`, and inline in-body **cid images**
+- `get_attachment` saves bytes to a file (or returns a **viewable image**) instead of dumping base64 into context, plus a `list_attachments` companion
+- `get_message format:"text"` and per-part MIME headers for lean, introspectable reads
+- `update_draft` keeps the plain-text and HTML parts in sync; RFC 2047/5322 encoding for non-ASCII (e.g. Hebrew) headers
+- Safer, clearer tool descriptions (irreversible deletes flagged; structured params steered over `raw`)
+
+Details in `.changeset/` / [CHANGELOG.md](./CHANGELOG.md). These changes are being contributed upstream.
+
 <p align="center"><img height="512" src=https://github.com/user-attachments/assets/b61db02e-bde4-4386-b5a9-2b1c6a989925></p>
 
 ## Features
