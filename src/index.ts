@@ -849,7 +849,7 @@ function createServer({ config }: { config?: Record<string, any> }) {
   )
 
   server.tool("batch_delete_messages",
-    "Delete multiple messages",
+    "Permanently delete multiple messages — bypasses Trash, IRREVERSIBLE (no recovery). To move them to Trash reversibly instead, use batch_modify_messages to add the TRASH label, or trash_message per message.",
     {
       ids: z.array(z.string()).describe("The IDs of the messages to delete")
     },
@@ -877,7 +877,7 @@ function createServer({ config }: { config?: Record<string, any> }) {
   )
 
   server.tool("delete_message",
-    "Immediately and permanently delete a message",
+    "Immediately and permanently delete a message — bypasses Trash, IRREVERSIBLE (no recovery). To move it to Trash reversibly instead, use trash_message.",
     {
       id: z.string().describe("The ID of the message to delete")
     },
@@ -1120,7 +1120,7 @@ function createServer({ config }: { config?: Record<string, any> }) {
   )
 
   server.tool("delete_thread",
-    "Delete a thread",
+    "Permanently delete a thread and ALL its messages — bypasses Trash, IRREVERSIBLE (no recovery). To move it to Trash reversibly instead, use trash_thread.",
     {
       id: z.string().describe("The ID of the thread to delete")
     },
