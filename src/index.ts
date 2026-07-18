@@ -535,7 +535,7 @@ function createServer({ config }: { config?: Record<string, any> }) {
       attachments: z.array(z.object({
         filename: z.string().optional().describe("Attachment filename, e.g. report.pdf. Inferred from the path if omitted."),
         mimeType: z.string().optional().describe("MIME type, e.g. application/pdf. Inferred from the filename extension if omitted."),
-        content: z.string().optional().describe("Base64-encoded file content. Provide either content or path; prefer path for large files to keep requests small."),
+        content: z.string().optional().describe("Base64-encoded file content. Provide either content or path. For BINARY files (images, PDFs, office docs) STRONGLY prefer path — base64 passed through a tool call can be silently mangled (a dropped byte truncates the file and corrupts it); path is read server-side losslessly. Use content only for small text, or when no local file exists."),
         path: z.string().optional().describe("Local filesystem path for the server to read and attach. Provide either path or content."),
         inline: z.boolean().optional().describe("Embed this part in the message body instead of adding it as a downloadable attachment. For an in-body image: set inline:true, give it a contentId, and reference it from htmlBody as <img src=\"cid:THAT_ID\">. Requires htmlBody. Defaults to false."),
         contentId: z.string().optional().describe("Content-ID for an inline part, referenced from htmlBody as <img src=\"cid:VALUE\">. Defaults to the filename when omitted. Only used when inline is true.")
@@ -679,7 +679,7 @@ function createServer({ config }: { config?: Record<string, any> }) {
       attachments: z.array(z.object({
         filename: z.string().optional().describe("Attachment filename, e.g. report.pdf. Inferred from the path if omitted."),
         mimeType: z.string().optional().describe("MIME type, e.g. application/pdf. Inferred from the filename extension if omitted."),
-        content: z.string().optional().describe("Base64-encoded file content. Provide either content or path; prefer path for large files to keep requests small."),
+        content: z.string().optional().describe("Base64-encoded file content. Provide either content or path. For BINARY files (images, PDFs, office docs) STRONGLY prefer path — base64 passed through a tool call can be silently mangled (a dropped byte truncates the file and corrupts it); path is read server-side losslessly. Use content only for small text, or when no local file exists."),
         path: z.string().optional().describe("Local filesystem path for the server to read and attach. Provide either path or content."),
         inline: z.boolean().optional().describe("Embed this part in the message body instead of adding it as a downloadable attachment. For an in-body image: set inline:true, give it a contentId, and reference it from htmlBody as <img src=\"cid:THAT_ID\">. Requires htmlBody. Defaults to false."),
         contentId: z.string().optional().describe("Content-ID for an inline part, referenced from htmlBody as <img src=\"cid:VALUE\">. Defaults to the filename when omitted. Only used when inline is true.")
@@ -994,7 +994,7 @@ function createServer({ config }: { config?: Record<string, any> }) {
       attachments: z.array(z.object({
         filename: z.string().optional().describe("Attachment filename, e.g. report.pdf. Inferred from the path if omitted."),
         mimeType: z.string().optional().describe("MIME type, e.g. application/pdf. Inferred from the filename extension if omitted."),
-        content: z.string().optional().describe("Base64-encoded file content. Provide either content or path; prefer path for large files to keep requests small."),
+        content: z.string().optional().describe("Base64-encoded file content. Provide either content or path. For BINARY files (images, PDFs, office docs) STRONGLY prefer path — base64 passed through a tool call can be silently mangled (a dropped byte truncates the file and corrupts it); path is read server-side losslessly. Use content only for small text, or when no local file exists."),
         path: z.string().optional().describe("Local filesystem path for the server to read and attach. Provide either path or content."),
         inline: z.boolean().optional().describe("Embed this part in the message body instead of adding it as a downloadable attachment. For an in-body image: set inline:true, give it a contentId, and reference it from htmlBody as <img src=\"cid:THAT_ID\">. Requires htmlBody. Defaults to false."),
         contentId: z.string().optional().describe("Content-ID for an inline part, referenced from htmlBody as <img src=\"cid:VALUE\">. Defaults to the filename when omitted. Only used when inline is true.")
